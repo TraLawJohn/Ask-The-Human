@@ -1,0 +1,311 @@
+================================================================================
+ASK_USER — Consolidated Test and Review Report
+================================================================================
+Generated: 2026-10-12
+Project: ask_user Pi Extension Tool
+Working Directory: C:/Users/gutta/CS480
+
+================================================================================
+CONTENTS
+================================================================================
+1. Test Suite Inventory (all .test.ts files)
+2. Test Cases (every test name and what it verifies)
+3. Reviewer Findings Summary
+4. Implementer Report Summary
+5. Final Verification
+
+================================================================================
+1. TEST SUITE INVENTORY
+================================================================================
+
+| File                         | Tests | Lines | Author      | Purpose                        |
+|------------------------------|-------|-------|-------------|--------------------------------|
+| ask_user.test.ts             | 11    | 189   | Implementer | Host result mapping tests      |
+| ask_user_dialog.test.ts      | 18    | 269   | Implementer | Dialog + validation tests      |
+| ask_user_integration.test.ts | 13    | 314   | Implementer | Pi-stub integration tests      |
+| ask_user_unavailable.test.ts | 4     | 121   | Implementer | Unavailable path tests         |
+| integration_check.ts         | 4     | 36    | Implementer | Cross-check of status branches |
+
+TOTAL: 50 tests in 4 test files + 4 integration checks
+
+================================================================================
+2. TEST CASES — DETAILED
+================================================================================
+
+--- ask_user.test.ts (host layer — askUserHost result mapping) ---
+
+1. "returns unavailable when hasUI is false"
+   Verifies: hasUI=false → status:"unavailable", answer:null, wasCustom:null
+   Content: "ask_user unavailable: no interactive terminal UI is present."
+
+2. "returns cancelled when the dialog resolves null"
+   Verifies: null result → status:"cancelled", answer:null, wasCustom:null
+   Content: "User cancelled the question."
+
+3. "returns answered with a selected option"
+   Verifies: {answer:"PostgreSQL", wasCustom:false, index:2} 
+   → status:"answered", content includes "User selected option 2: PostgreSQL"
+
+4. "returns answered with a custom answer"
+   Verifies: {answer:"DuckDB", wasCustom:true} 
+   → status:"answered", content includes "User provided a custom answer: DuckDB"
+
+5. "preserves all input metadata in the details object"
+   Verifies: question, reason, options array, recommendation all preserved
+
+6. "returns unavailable with optional recommendation omitted"
+   Verifies: recommendation stays undefined in details when not provided
+
+7. "handles exactly three options and reports index 3 correctly"
+   Verifies: boundary case at max options (3) works with index:3
+
+8. "uses '?' fallback when index is missing for a non-custom answer"
+   Verifies: dialog omits index → content shows "?" instead
+
+9. "preserves a whitespace-only answer from the dialog as-is (host trusts dialog)"
+   Verifies: host does not modify/trusts what dialog returns
+
+10. "preserves an empty-string answer from the dialog as-is (host trusts dialog)"
+    Verifies: host does not reject empty string from dialog
+
+11. "returns cancelled when the dialog wrapper catches an exception (UI crash safety)"
+    Verifies: dialog throws → catch → null → status:"cancelled"
+    (Added after reviewer finding #2)
+
+--- ask_user_dialog.test.ts (dialog layer — runAskUserDialog + validation) ---
+
+VALIDATEASKUSERPARAMS (8 tests):
+
+12. "accepts valid params with 2 options"
+    Verifies: normal 2-option input passes validation
+
+13. "accepts valid params with 3 options"
+    Verifies: max boundary (3 options) passes validation
+
+14. "rejects fewer than 2 options"
+    Verifies: throws with /requires 2–3 options/
+
+15. "rejects more than 3 options"
+    Verifies: throws with /requires 2–3 options/
+
+16. "rejects duplicate option labels"
+    Verifies: throws with /unique labels/ when two options share label
+    (Added after reviewer finding #1)
+
+17. "rejects empty option label"
+    Verifies: throws when label is ""
+
+18. "rejects empty tradeoff"
+    Verifies: throws when tradeoff is ""
+
+19. "rejects whitespace-only tradeoff"
+    Verifies: throws when tradeoff is "   "
+    (Added after reviewer finding #9)
+
+RUNASKUSERDIALOG (10 tests):
+
+20. "selects a known option and returns its label + index"
+    Verifies: select returns option[1] → {answer:"PostgreSQL", wasCustom:false, index:2}
+
+21. "selects 'Write custom answer...' and returns the typed custom answer"
+    Verifies: select→custom + input→"DuckDB" → {answer:"DuckDB", wasCustom:true}
+
+22. "returns null when select is dismissed (cancellation)"
+    Verifies: select returns undefined → null → cancelled
+
+23. "returns null when custom input is dismissed (cancellation)"
+    Verifies: select→custom, input returns undefined → null → cancelled
+
+24. "returns null when custom input is empty (no silent consent)"
+    Verifies: select→custom, input returns "" → trim → null → cancelled
+
+25. "returns null when custom input is whitespace-only (no silent consent)"
+    Verifies: select→custom, input returns "   " → trim → null → cancelled
+
+26. "builds the title with question, reason, and recommendation"
+    Verifies: title string includes all three components
+
+27. "builds the title without recommendation when omitted"
+    Verifies: no recommendation → no "Recommendation:" in title
+
+28. "includes tradeoffs in option labels shown to select"
+    Verifies: labels array contains "label — tradeoff" format + "Write custom answer..."
+
+29. "returns null when select returns an unknown string (safety fallback)"
+    Verifies: select returns gibberish → idx=-1 → null → cancelled
+    (Added after reviewer finding #4)
+
+--- ask_user_integration.test.ts (Pi-stub integration — full execute path) ---
+
+30. "registers the tool with correct name and label"
+    Verifies: pi.registerTool called with name:"ask_user", label:"Ask User"
+    (Tests reviewer finding #5 — execute not exercised end-to-end)
+
+31. "renderCall includes question, recommendation, and option labels"
+    Verifies: renderCall output contains question, recommendation, all option labels
+    (Tests reviewer finding #3 — renderCall untested)
+
+32. "renderResult shows unavailable status"
+    Verifies: details.status="unavailable" → rendered text includes "Unavailable"
+    (Tests reviewer finding #3 — renderResult untested)
+
+33. "renderResult shows cancelled status"
+    Verifies: details.status="cancelled" → rendered text includes "Cancelled"
+    (Tests reviewer finding #3)
+
+34. "renderResult shows answered option status"
+    Verifies: answered option → rendered text contains option label
+    (Tests reviewer finding #3)
+
+35. "renderResult shows answered custom status"
+    Verifies: answered custom → rendered text contains "(custom)" + answer
+    (Tests reviewer finding #3)
+
+36. "renderResult shows '(no answer)' fallback when answer is missing"
+    Verifies: answered with empty answer → "(no answer)" fallback text
+    (Tests reviewer finding #3)
+
+37. "execute returns answered when user picks an option"
+    Verifies: full execute() path with mock ctx.ui.select → real option result
+    (Tests reviewer finding #5)
+
+38. "execute returns answered when user provides a custom answer"
+    Verifies: full execute() with mock select→custom + input→text
+    (Tests reviewer finding #5)
+
+39. "execute returns cancelled when user dismisses select"
+    Verifies: full execute() with mock select returning undefined
+    (Tests reviewer finding #5)
+
+40. "execute returns unavailable when UI is not present"
+    Verifies: full execute() with ctx.mode="print", hasUI=false
+    (Tests reviewer finding #5)
+
+41. "execute throws on duplicate option labels (validation)"
+    Verifies: validateAskUserParams wired through execute → throws on dup labels
+    (Tests reviewer finding #5)
+
+42. "execute returns cancelled when UI primitive throws"
+    Verifies: ctx.ui.select throws Error → catch → status:"cancelled"
+    (Tests reviewer finding #2 and #6)
+
+--- ask_user_unavailable.test.ts (unavailable path demonstration) ---
+
+43. "TEST 1: askUserHost with hasUI = false"
+    Verifies: direct host call with hasUI=false → unavailable details + content
+
+44. "TEST 2: Tool execute in print mode (no UI)"
+    Verifies: execute() in print mode → unavailable without opening dialog
+
+45. "TEST 3: Tool execute in rpc mode (hasUI = false)"
+    Verifies: execute() in rpc mode + hasUI=false → unavailable
+
+46. "TEST 4: renderResult for unavailable status"
+    Verifies: renderResult renders "[warning:Unavailable (no UI)]"
+
+--- integration_check.ts (status branch cross-check) ---
+
+47. "unavailable" check — hasUI=false → status:"unavailable"
+48. "cancelled" check — null result → status:"cancelled"
+49. "answered option" check — {answer, wasCustom:false} → status:"answered"
+50. "answered custom" check — {answer, wasCustom:true} → status:"answered"
+
+================================================================================
+3. REVIEWER FINDINGS SUMMARY
+================================================================================
+
+--- First Review (reviewer_findings.txt) ---
+
+Defect 1 — SERIOUS — Dialog omits reason/recommendation from title
+Defect 2 — SERIOUS — Zero tests for ask_user.ts (only host tested)
+Defect 3 — MINOR  — Test fixture has 1 option (violates minItems:2)
+Defect 4 — MINOR  — renderResult empty display if answer null in answered status
+
+Resolution: Defects 1, 3, 4 fixed. Defect 2 deferred (Pi runtime dependency).
+
+--- Second Review (reviewer_spec_review.txt) ---
+
+Defect 1 — SERIOUS — Duplicate option labels cause wrong index (indexOf first match)
+Defect 2 — SERIOUS — Cancelled paths (Esc vs empty) not distinguished, all → null
+Defect 3 — None    — No UI correctly returns unavailable
+Defect 4 — MINOR  — Answer contradicting recommendation not flagged
+Defect 5 — MINOR  — Custom answer matching option label not normalized
+Defect 6 — MINOR  — Dialog safety fallback untested
+Defect 7 — SERIOUS — UI exceptions propagate uncaught
+Defect 8 — SERIOUS — Schema allows duplicate labels
+Defect 9 — MINOR  — Empty tradeoff strings allowed
+Defect 10— MINOR  — Recommendation is unstructured text
+
+Resolution: Human chose Option 1 (fix #1 and #7).
+- #1: Added validateAskUserParams() with unique label enforcement
+- #7: Added try/catch around runAskUserDialog, catches → cancelled
+- #8: Fixed by #1 (schema + runtime validation)
+- #9: Fixed by #1 (non-empty tradeoff check)
+
+--- Third Review (reviewer_final.txt) ---
+
+Defect 1 — SERIOUS — Host tests exercise impossible dialog state
+Defect 2 — SERIOUS — Exception path in execute() untested
+Defect 3 — SERIOUS — renderCall/renderResult untested
+Defect 4 — MINOR  — Dialog safety fallback untested
+Defect 5 — MINOR  — execute() + validateAskUserParams not end-to-end
+Defect 6 — MINOR  — UI crash misreported as "cancelled"
+
+Resolution: Human chose Option 3 (fix #3 + #5 with Pi stubs).
+- #2: Added host test "returns cancelled when dialog wrapper catches exception"
+- #3: Added 7 Pi-stub tests for renderCall + renderResult (all 4 statuses)
+- #4: Added dialog test "returns null when select returns unknown string"
+- #5: Added 6 Pi-stub execute tests (option, custom, cancel, unavailable, validation, exception)
+- #1: Documented as contract test (host trusts dialog)
+- #6: Accepted as safe fallback (structured result over raw error)
+
+================================================================================
+4. IMPLEMENTER REPORT SUMMARY
+================================================================================
+
+--- First Implementation ---
+Refactored ask_user.ts to delegate result mapping to ask_user_host.ts.
+Kept TUI rendering (custom terminal interface with Editor, keyboard handlers).
+Removed pure logic from execute().
+
+--- Second Implementation ---
+Rewrote ask_user.ts to use ctx.ui.select and ctx.ui.input (Pi built-in dialogs).
+Extracted dialog logic into ask_user_dialog.ts.
+Added promptSnippet and promptGuidelines for model-facing instructions.
+
+--- Third Implementation ---
+Added validateAskUserParams() for duplicate labels, empty fields, count bounds.
+Added try/catch around dialog for exception safety.
+Fixed dialog title to include reason and recommendation.
+Fixed renderResult fallback for missing answer.
+
+--- Pi Extension Install ---
+Installed at: ~/.pi/agent/extensions/ask_user/
+Files: ask_user.ts, ask_user_host.ts, ask_user_dialog.ts, index.ts
+Activated via: /reload in Pi
+
+================================================================================
+5. FINAL VERIFICATION
+================================================================================
+
+Last run: 2026-10-12 20:01
+
+| Suite                        | Tests | Pass | Fail |
+|------------------------------|-------|------|------|
+| ask_user.test.ts             | 11    | 11   | 0    |
+| ask_user_dialog.test.ts      | 18    | 18   | 0    |
+| ask_user_integration.test.ts | 13    | 13   | 0    |
+| ask_user_unavailable.test.ts | 4     | 4    | 0    |
+| integration_check.ts         | 4     | 4    | 0    |
+| TOTAL                        | 50    | 50   | 0    |
+
+Command to run all tests:
+  export NODE_PATH=".../pi-coding-agent/node_modules"
+  npx tsx --test ask_user.test.ts ask_user_dialog.test.ts
+  npx tsx --test ask_user_integration.test.ts
+  npx tsx --test ask_user_unavailable.test.ts
+  npx tsx integration_check.ts
+
+================================================================================
+END OF REPORT
+================================================================================
