@@ -1,0 +1,376 @@
+-rw-r--r-- 1 gutta 197609  3576 Oct 12 17:51 ask_user.test.ts
+-rw-r--r-- 1 gutta 197609 12575 Oct 12 17:56 ask_user.ts
+-rw-r--r-- 1 gutta 197609  3289 Oct 12 17:50 ask_user_host.ts
+▶ ask_user_host — testable dialog interface
+  ✔ returns unavailable when hasUI is false (0.6387ms)
+  ✔ returns cancelled when the dialog resolves null (0.1742ms)
+  ✔ returns answered with a selected option (0.1284ms)
+  ✔ returns answered with a custom answer (0.1104ms)
+  ✔ preserves all input metadata in the details object (0.632ms)
+✔ ask_user_host — testable dialog interface (2.8538ms)
+ℹ tests 5
+ℹ suites 1
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 163.9963
+/**
+ * ask_user — single important-choice question with tradeoffs
+ *
+ * Displays one question, the reason it matters, 2–3 options (each with a
+ * tradeoff), and an optional recommendation.  The user picks an option or
+ * writes a custom answer.  The tool returns an explicit status:
+ *   • "answered"    – user's custom response or the chosen option
+ *   • "cancelled"   – user cancels or submits an empty custom response
+ *   • "unavailable" – no interactive terminal UI is present
+ */
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  Editor,
+  type EditorTheme,
+  Key,
+  matchesKey,
+  Text,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import {
+  askUserHost,
+  type AskUserOption,
+  type AskUserDetails,
+  type DialogResult,
+} from "./ask_user_host";
+
+/* ------------------------------------------------------------------ */
+/*  Schema                                                            */
+/* ------------------------------------------------------------------ */
+
+const OptionSchema = Type.Object({
+  label: Type.String({ description: "Short display label for this option" }),
+  tradeoff: Type.String({
+    description: "Brief description of the tradeoffs / consequences for this option",
+  }),
+});
+
+const AskUserParams = Type.Object({
+  question: Type.String({ description: "One clear question to ask the user" }),
+  reason: Type.String({
+    description: "Brief reason this choice matters for the current task",
+  }),
+  options: Type.Array(OptionSchema, {
+    minItems: 2,
+    maxItems: 3,
+    description:
+      "Two or three options with tradeoffs. Each option must have a label and a tradeoff description.",
+  }),
+  recommendation: Type.Optional(
+    Type.String({
+      description:
+        "Optional recommendation indicating the preferred option and why. Leave empty if you have no clear preference.",
+    }),
+  ),
+});
+
+/* ------------------------------------------------------------------ */
+/*  Types                                                             */
+/* ------------------------------------------------------------------ */
+
+type DisplayOption = AskUserOption & { isOther?: boolean };
+
+/* ------------------------------------------------------------------ */
+/*  Tool                                                              */
+/* ------------------------------------------------------------------ */
+
+export default function askUser(pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "ask_user",
+    label: "Ask User",
+    description:
+      "Ask the user a single important unresolved product choice with 2–3 options and their tradeoffs. " +
+      "Call this tool when the user has left an important choice unresolved (for example, 'Make reminders persist or not, as you think best'). " +
+      "DO NOT call this tool when the user has already specified the behavior (for example, 'Keep reminder state only for this session. Do not persist it after the app closes'). " +
+      "DO NOT call for routine variable names, explicit requirements, or when the user delegates the choice to you. " +
+      "Proceed without questions for explicit requirements or routine reversible details.",
+    parameters: AskUserParams,
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      /* ---- option list (including custom) ------------------------- */
+      const allOptions: DisplayOption[] = [
+        ...params.options,
+        { label: "Write custom answer...", tradeoff: "", isOther: true },
+      ];
+
+      return askUserHost(params, {
+        hasUI: ctx.mode === "tui" && ctx.hasUI,
+        dialog: async () =>
+          ctx.ui.custom<DialogResult>((tui, theme, _kb, done) => {
+            let optionIndex = 0;
+            let editMode = false;
+            let cachedLines: string[] | undefined;
+
+            const editorTheme: EditorTheme = {
+              borderColor: (s) => theme.fg("accent", s),
+              selectList: {
+                selectedPrefix: (t) => theme.fg("accent", t),
+                selectedText: (t) => theme.fg("accent", t),
+                description: (t) => theme.fg("muted", t),
+                scrollInfo: (t) => theme.fg("dim", t),
+                noMatch: (t) => theme.fg("warning", t),
+              },
+            };
+            const editor = new Editor(tui, editorTheme);
+
+            editor.onSubmit = (value) => {
+              const trimmed = value.trim();
+              if (trimmed) {
+                done({ answer: trimmed, wasCustom: true });
+              } else {
+                /* empty custom answer → back to list (no silent consent) */
+                editMode = false;
+                editor.setText("");
+                refresh();
+              }
+            };
+
+            function refresh() {
+              cachedLines = undefined;
+              tui.requestRender();
+            }
+
+            function handleInput(data: string) {
+              if (editMode) {
+                if (matchesKey(data, Key.escape)) {
+                  editMode = false;
+                  editor.setText("");
+                  refresh();
+                  return;
+                }
+                editor.handleInput(data);
+                refresh();
+                return;
+              }
+
+              if (matchesKey(data, Key.up)) {
+                optionIndex = Math.max(0, optionIndex - 1);
+                refresh();
+                return;
+              }
+              if (matchesKey(data, Key.down)) {
+                optionIndex = Math.min(allOptions.length - 1, optionIndex + 1);
+                refresh();
+                return;
+              }
+
+              if (matchesKey(data, Key.enter)) {
+                const selected = allOptions[optionIndex];
+                if (selected.isOther) {
+                  editMode = true;
+                  refresh();
+                } else {
+                  done({
+                    answer: selected.label,
+                    wasCustom: false,
+                    index: optionIndex + 1,
+                  });
+                }
+                return;
+              }
+
+              if (matchesKey(data, Key.escape)) {
+                done(null); /* cancelled */
+                return;
+              }
+            }
+
+            /* ---- helpers ----------------------------------------------- */
+            function addWrapped(lines: string[], text: string, width: number) {
+              lines.push(...wrapTextWithAnsi(text, Math.max(1, width)));
+            }
+
+            function addWrappedWithPrefix(
+              lines: string[],
+              prefix: string,
+              text: string,
+              width: number,
+            ) {
+              const prefixWidth = visibleWidth(prefix);
+              const renderWidth = Math.max(1, width);
+              if (prefixWidth >= renderWidth) {
+                addWrapped(lines, prefix + text, width);
+                return;
+              }
+              const wrapped = wrapTextWithAnsi(text, renderWidth - prefixWidth);
+              const continuationPrefix = " ".repeat(prefixWidth);
+              for (let i = 0; i < wrapped.length; i++) {
+                lines.push(
+                  `${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`,
+                );
+              }
+            }
+
+            /* ---- render ------------------------------------------------ */
+            function render(width: number): string[] {
+              if (cachedLines) return cachedLines;
+              const lines: string[] = [];
+              const w = Math.max(1, width);
+
+              /* header bar */
+              lines.push(theme.fg("accent", "─".repeat(w)));
+
+              /* question */
+              addWrappedWithPrefix(lines, " ", theme.fg("text", params.question), w);
+              lines.push("");
+
+              /* reason */
+              addWrappedWithPrefix(
+                lines,
+                " ",
+                theme.fg("muted", `Why it matters: ${params.reason}`),
+                w,
+              );
+
+              /* optional recommendation */
+              if (params.recommendation) {
+                lines.push("");
+                addWrappedWithPrefix(
+                  lines,
+                  " ",
+                  theme.fg("accent", `Recommendation: ${params.recommendation}`),
+                  w,
+                );
+              }
+
+              lines.push("");
+
+              /* options */
+              for (let i = 0; i < allOptions.length; i++) {
+                const opt = allOptions[i];
+                const selected = i === optionIndex;
+                const isOther = opt.isOther === true;
+                const prefix = selected ? theme.fg("accent", "> ") : "  ";
+                const labelColor = selected || (isOther && editMode) ? "accent" : "text";
+                const label = `${i + 1}. ${opt.label}${isOther && editMode ? " ✎" : ""}`;
+
+                addWrappedWithPrefix(lines, prefix, theme.fg(labelColor, label), w);
+
+                if (!isOther && opt.tradeoff) {
+                  addWrappedWithPrefix(
+                    lines,
+                    "     ",
+                    theme.fg("muted", `Tradeoff: ${opt.tradeoff}`),
+                    w,
+                  );
+                }
+              }
+
+              /* editor when in custom mode */
+              if (editMode) {
+                lines.push("");
+                addWrappedWithPrefix(
+                  lines,
+                  " ",
+                  theme.fg("muted", "Your custom answer:"),
+                  w,
+                );
+                for (const line of editor.render(Math.max(1, w - 2))) {
+                  lines.push(` ${line}`);
+                }
+              }
+
+              /* footer hint */
+              lines.push("");
+              if (editMode) {
+                addWrappedWithPrefix(
+                  lines,
+                  " ",
+                  theme.fg("dim", "Enter to submit • Esc to go back"),
+                  w,
+                );
+              } else {
+                addWrappedWithPrefix(
+                  lines,
+                  " ",
+                  theme.fg("dim", "↑↓ navigate • Enter to select • Esc to cancel"),
+                  w,
+                );
+              }
+              lines.push(theme.fg("accent", "─".repeat(w)));
+
+              cachedLines = lines;
+              return lines;
+            }
+
+            return {
+              render,
+              invalidate: () => {
+                cachedLines = undefined;
+              },
+              handleInput,
+            };
+          }),
+      });
+    },
+
+    /* ---------------------------------------------------------------- */
+    /*  Renderers                                                       */
+    /* ---------------------------------------------------------------- */
+
+    renderCall(args, theme, _context) {
+      const q = String(args.question ?? "");
+      const rec = args.recommendation
+        ? ` • Rec: ${args.recommendation}`
+        : "";
+      const opts = Array.isArray(args.options)
+        ? args.options.map((o: AskUserOption, i: number) => `${i + 1}. ${o.label}`)
+        : [];
+      const optText = opts.length
+        ? ` • Options: ${opts.join(", ")}, Write custom answer...`
+        : "";
+      const text =
+        theme.fg("toolTitle", theme.bold("ask_user ")) +
+        theme.fg("muted", `${q}${rec}${optText}`);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as AskUserDetails | undefined;
+      if (!details) {
+        const text = result.content[0];
+        return new Text(text?.type === "text" ? text.text : "", 0, 0);
+      }
+
+      if (details.status === "unavailable") {
+        return new Text(theme.fg("warning", "Unavailable (no UI)"), 0, 0);
+      }
+
+      if (details.status === "cancelled") {
+        return new Text(theme.fg("warning", "Cancelled"), 0, 0);
+      }
+
+      if (details.wasCustom) {
+        return new Text(
+          theme.fg("success", "✓ ") +
+            theme.fg("muted", "(custom) ") +
+            theme.fg("accent", details.answer ?? ""),
+          0,
+          0,
+        );
+      }
+
+      const idx =
+        (details.options.indexOf(details.answer ?? "") + 1) ||
+        (details.answer ? "?" : "");
+      const display = details.answer ? `${idx}. ${details.answer}` : "";
+      return new Text(
+        theme.fg("success", "✓ ") + theme.fg("accent", display),
+        0,
+        0,
+      );
+    },
+  });
+}

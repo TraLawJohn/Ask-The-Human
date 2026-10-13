@@ -1,0 +1,126 @@
+Independent Diff Inspection — ask_user final review
+====================================================
+
+Files reviewed:
+- ask_user.ts (tool registration, execute(), renderers)
+- ask_user_host.ts (result mapping contract)
+- ask_user_dialog.ts (dialog orchestration + validation)
+- ask_user.test.ts (host tests)
+- ask_user_dialog.test.ts (dialog + validation tests)
+- integration_check.ts (integration checks)
+
+Checks run:
+- npx tsx --test ask_user.test.ts        → 10/10 passed
+- npx tsx --test ask_user_dialog.test.ts  → 17/17 passed
+- npx tsx integration_check.ts            → passed
+
+--------------------------------------------------------------------
+DEFECT 1 — SERIOUS — Gap between test claim and real dialog behavior
+--------------------------------------------------------------------
+File: ask_user.test.ts
+Lines: 156–167 and 170–181
+
+Finding: Two edge-case tests in ask_user.test.ts pass the host a DialogResult with `wasCustom: true, answer: "   "` and `wasCustom: true, answer: ""`. These verify the host preserves whatever the dialog gives it. BUT the real `runAskUserDialog` in ask_user_dialog.ts (lines 65–67) explicitly rejects empty and whitespace-only custom answers — it returns `null` (cancelled). These inputs can never be produced by the actual dialog, so the tests exercise an impossible state rather than the real edge case.
+
+Reproduction: Read ask_user_dialog.ts lines 65–67:
+  `const trimmed = answer.trim();`
+  `if (!trimmed) { return null; }`
+Then read ask_user.test.ts line 160: the fake dialog returns `{ answer: "   ", wasCustom: true }`, which the real dialog would never emit.
+
+Expected: Either (a) test the dialog layer directly for the real behavior (empty/whitespace → cancelled), or (b) document that the host test is a contract test for "host trusts dialog" and add a corresponding dialog test that proves the real rejection happens.
+
+Note: ask_user_dialog.test.ts DOES already test this rejection at the dialog layer (lines 82–94), so the behavior is correct. The issue is that the host tests claim to test an edge case the code path cannot reach.
+
+--------------------------------------------------------------------
+DEFECT 2 — SERIOUS — Untested exception path in execute()
+--------------------------------------------------------------------
+File: ask_user.ts
+Lines: 112–116
+
+Finding: The `execute()` method wraps `runAskUserDialog` in a `try/catch`. If `ctx.ui.select` or `ctx.ui.input` throws (stream closed, TUI crash), the tool returns `null` from the dialog, which `askUserHost` maps to `status: "cancelled"` with content text "User cancelled the question.". There is no test for this branch.
+
+Reproduction: None exists. A test would need a fake `ctx.ui.select` that throws, e.g.:
+  `async dialog() { throw new Error("stream closed"); }`
+The expected result is a structured `cancelled` output, not a raw exception bubble.
+
+Expected: Add a test for `askUserHost` (or for `execute` via a mock ExtensionAPI) that verifies the exception→cancelled mapping. Without this test, a future refactor of the try/catch could accidentally let raw errors propagate again.
+
+--------------------------------------------------------------------
+DEFECT 3 — SERIOUS — Renderers completely untested
+--------------------------------------------------------------------
+File: ask_user.ts
+Lines: 127–184 (renderCall and renderResult)
+
+Finding: There are zero tests for `renderCall` or `renderResult`. These are pure functions (no side effects) that accept `(args, theme, context)` and return `Text` objects. They could be tested with a mock theme object.
+
+Reproduction: Search ask_user.test.ts and ask_user_dialog.test.ts — neither file imports from ask_user.ts. No `renderCall` or `renderResult` calls exist in any test.
+
+Expected: Add at least:
+- A renderCall test verifying the text includes the question, recommendation, and option labels.
+- A renderResult test for each status (unavailable, cancelled, answered-custom, answered-option) verifying the rendered text.
+- A renderResult test for the "no answer" fallback branch that was fixed in a previous diff (ask_user.ts line 183 now shows "(no answer)").
+
+--------------------------------------------------------------------
+DEFECT 4 — MINOR — Dialog safety fallback untested
+--------------------------------------------------------------------
+File: ask_user_dialog.ts
+Lines: 85–86
+
+Finding: The safety fallback `if (idx === -1 || idx >= params.options.length)` has no test coverage. This path would trigger only if `ui.select` returns a string that is not in the `labels` array — an impossible scenario with the real Pi UI, but possible with a buggy or malicious fake UI.
+
+Reproduction: A test that injects a fake UI returning a gibberish string:
+  `select: async () => "TotallyInvalidOption"`
+Expected result: `null` (cancelled). No such test exists.
+
+Expected: Add a dialog test covering this fallback.
+
+--------------------------------------------------------------------
+DEFECT 5 — MINOR — execute() and validateAskUserParams not exercised end-to-end
+--------------------------------------------------------------------
+File: ask_user.ts
+Lines: 105–120
+
+Finding: `integration_check.ts` imports ONLY from `ask_user_host.ts`. It does not import `askUser` or run `validateAskUserParams`. The tool registration, schema wiring, and `execute()` method are never exercised in any automated check.
+
+Reproduction: Read integration_check.ts — it calls `askUserHost` directly with mock deps. The `validateAskUserParams` function (ask_user_dialog.ts) is tested in isolation (ask_user_dialog.test.ts), but not through the tool's `execute()` path.
+
+Expected: The integration check should either import and call the registered tool object, or a new test file should exercise `execute()` with a mock ExtensionAPI and mock `ctx.ui`.
+
+--------------------------------------------------------------------
+DEFECT 6 — MINOR — Misattribution of UI exceptions as "cancelled"
+--------------------------------------------------------------------
+File: ask_user.ts
+Line: 115 (catch block returning `null`)
+
+Finding: When `ctx.ui.select` throws due to a crash or stream closure, the catch block returns `null`, which the host maps to `status: "cancelled"` with the message "User cancelled the question.". The user did NOT cancel — the UI broke. This misattributes a system error to a user action.
+
+Reproduction: Inject a fake dialog that throws:
+  `async dialog() { throw new Error("TUI stream disconnected"); }`
+Result: content text says "User cancelled the question." — the user never pressed Esc.
+
+Expected: Consider catching the exception and returning a new `DialogResult` shape (or a new status like "unavailable") that reflects the UI failure rather than user cancellation. If preserving the three-status contract is required, at minimum the content text should indicate a system error, e.g. "UI error prevented asking the user."
+
+--------------------------------------------------------------------
+NON-DEFECTS — Verified correct since last review
+--------------------------------------------------------------------
+1. Schema + runtime validation now enforces unique labels (ask_user_dialog.ts:26–37).
+2. Empty and whitespace-only tradeoffs are rejected (ask_user_dialog.ts:38–43).
+3. Empty and whitespace-only option labels are rejected (ask_user_dialog.ts:30–32).
+4. `reason` and `recommendation` are included in the dialog title (ask_user_dialog.ts:50–56).
+5. Empty/whitespace custom answers return `null` (cancelled) with no silent consent (ask_user_dialog.ts:65–67).
+6. `renderResult` fallback now displays "(no answer)" instead of empty text (ask_user.ts:183).
+7. `promptSnippet`, `promptGuidelines`, `description`, `executionMode`, and schema all match the agreed spec.
+8. `details` object preserves all input metadata across all three status branches.
+
+--------------------------------------------------------------------
+SUMMARY TABLE
+--------------------------------------------------------------------
+
+| # | Issue | Severity | Affects agreed requirement? |
+|---|-------|----------|----------------------------|
+| 1 | Host tests exercise impossible dialog state (empty/whitespace custom answer with wasCustom:true) | Serious | Yes — "Validate the input" (tests misrepresent real behavior) |
+| 2 | Exception path in execute() has no test coverage | Serious | Yes — "Check whether dialog UI is available" (resilience) |
+| 3 | renderCall and renderResult untested | Serious | Yes — "Include answer/status in model-facing tool result" |
+| 4 | Dialog safety fallback (unknown selected string) untested | Minor | Partially — correctness coverage gap |
+| 5 | execute() and validateAskUserParams not exercised end-to-end | Minor | Partially — integration coverage gap |
+| 6 | UI exceptions reported as "cancelled" (user misattributed) | Minor | Partially — "Map responses into agreed result format" |

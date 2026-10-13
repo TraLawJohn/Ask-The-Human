@@ -1,0 +1,148 @@
+Independent Spec Review — ask_user tool
+========================================
+
+Files reviewed:
+- ask_user.ts (tool registration, execute(), renderers, promptGuidelines)
+- ask_user_host.ts (result mapping contract)
+- ask_user_dialog.ts (dialog orchestration)
+- ask_user.test.ts (host test coverage)
+- ask_user_dialog.test.ts (dialog test coverage)
+
+--------------------------------------------------------------------
+CHECK 1 — Ambiguous option labels
+--------------------------------------------------------------------
+Status: MISSED OUTCOME — Blocking under specific input
+
+The dialog identifies the selected option by doing `labels.indexOf(selected)` (ask_user_dialog.ts:78). If two options share the same `label` string, `indexOf` returns the FIRST match. The user might have selected option 2, but the tool reports option 1. The schema does NOT enforce label uniqueness.
+
+Additionally, `renderResult` in ask_user.ts uses `details.options.indexOf(details.answer)` to compute the index for display. Duplicate labels here also resolve to the first match, so the renderer may show the wrong option number.
+
+The model also has no structured way to know which option was picked if labels collide — it only sees the label string, not a stable ID.
+
+Recommendation: Enforce unique labels in schema or runtime validation, or switch to index-based selection in the dialog.
+
+--------------------------------------------------------------------
+CHECK 2 — Cancelled input: Esc in select vs Esc in input vs empty submit
+--------------------------------------------------------------------
+Status: NOT SURFACED DISTINCTLY — Same result for three different user actions
+
+All three paths collapse to `DialogResult = null`, which `askUserHost` maps to `status: "cancelled"` with identical content text ("User cancelled the question."):
+
+- Esc during `ctx.ui.select` → `selected === undefined` → `null`
+- Esc during `ctx.ui.input` (custom answer) → `answer === undefined` → `null`
+- Empty or whitespace-only custom answer → `trimmed` is falsy → `null`
+
+The model cannot distinguish whether the user:
+  (a) rejected the entire question,
+  (b) entered custom mode then backed out, or
+  (c) submitted an empty custom answer.
+
+This matters for UX reasoning: case (c) might suggest the user wants a custom answer but accidentally hit Enter, while case (a) suggests disinterest. The promptGuidelines only say "do not invent an answer," which is safe but coarse.
+
+Recommendation: Consider distinguishing "dismissed" from "empty custom" in `DialogResult` or `details`, or document explicitly that all three paths are intentionally unified.
+
+--------------------------------------------------------------------
+CHECK 3 — No UI: rpc / json / print mode behavior
+--------------------------------------------------------------------
+Status: HANDLED CORRECTLY — No defect found
+
+`execute()` computes `hasUI` as `ctx.mode === "tui" && ctx.hasUI` (ask_user.ts:96). Any non-TUI mode (rpc, json, print) results in `hasUI: false`. `askUserHost` returns:
+  - status: "unavailable"
+  - content: "ask_user unavailable: no interactive terminal UI is present."
+  - full metadata preserved in `details`
+
+The promptGuidelines instruct the model: "If the result is 'cancelled' or 'unavailable', do not invent an answer. Continue by identifying the exact unresolved requirement in your reasoning."
+
+This satisfies the requirement that the model is told WHY it cannot ask and WHAT to do instead.
+
+--------------------------------------------------------------------
+CHECK 4 — Answer that contradicts the recommendation
+--------------------------------------------------------------------
+Status: MISSED OUTCOME — Not flagged
+
+`recommendation` is stored in `details` as free-form text, but the host and dialog do not compare the user's answer against it. If the tool recommends "Use PostgreSQL" and the user selects "SQLite", the result is a plain:
+  - status: "answered"
+  - answer: "SQLite"
+  - wasCustom: false
+
+There is no field like `contradictsRecommendation: true` and the content text does not note the divergence. The model must parse the recommendation string and the answer string itself to detect contradiction, which is unreliable because the recommendation is unstructured prose.
+
+Recommendation: Either (a) add a boolean flag to `details` when the selected option's label is mentioned in the recommendation, or (b) document that the model should treat the recommendation as guidance only and never override the user's explicit choice.
+
+--------------------------------------------------------------------
+ADDITIONAL MISSED EDGE CASES
+--------------------------------------------------------------------
+
+5. CUSTOM ANSWER MATCHES AN EXISTING OPTION LABEL
+   If the user types "SQLite" as a custom answer, `wasCustom` is still `true`. The model sees `(custom) SQLite` rather than the option format. The host does not normalize or deduplicate. This is cosmetic but could confuse model reasoning.
+
+6. DIALOG SAFETY FALLBACK NEVER TESTED
+   ask_user_dialog.ts:79-80 has a safety fallback:
+     `if (idx === -1 || idx >= params.options.length) { return null; }`
+   None of the dialog tests exercise a scenario where `ui.select` returns a string not present in `labels`. This path is uncovered.
+
+7. UNCAUGHT EXCEPTIONS FROM UI PRIMITIVES
+   If `ctx.ui.select` or `ctx.ui.input` throws (e.g., TUI crash, stream closed), the exception propagates uncaught through `runAskUserDialog` and `askUserHost`. There is no try/catch in `execute()` or `dialog()`. The tool would return a raw error instead of a structured `unavailable` or `cancelled` result.
+
+8. SCHEMA DOES NOT REJECT DUPLICATE LABELS
+   As noted in Check 1, `Type.String()` on `label` does not include `uniqueItems` at the array level or any uniqueness constraint. The `options` array itself could be `[{label:"A",tradeoff:"x"},{label:"A",tradeoff:"y"}]` and pass validation.
+
+9. EMPTY TRADEOFF STRINGS ALLOWED
+   `tradeoff: Type.String()` permits `""`. The dialog label would render as `"1. Option — "` which looks broken. No trimming or rejection is applied.
+
+10. RECOMMENDATION IS FREE-FORM, NOT INDEXED
+    Because `recommendation` is a plain string rather than an `optionIndex` or `optionLabel` reference, the model and renderer must infer which option is recommended. This makes automated contradiction detection impossible and relies on the model's reading comprehension.
+
+--------------------------------------------------------------------
+EVALUATION SCENARIOS
+--------------------------------------------------------------------
+
+SCENARIO A — Agent SHOULD use ask_user
+--------------------------------------
+User prompt:
+  "Build me a habit-tracking web app with reminders. I want the app to nudge me about unfinished habits, but I'm not sure how that should work. You decide what's best — maybe browser notifications, in-app badges, or email digests. I trust your judgment."
+
+Why the agent SHOULD ask:
+- The user explicitly delegates the choice ("You decide what's best").
+- The reminder mechanism is a product-level decision with real tradeoffs:
+  • Browser notifications — intrusive but timely
+  • In-app badges — passive, easy to ignore
+  • Email digests — reliable but delayed
+- The choice affects implementation architecture, permissions, and third-party integrations.
+- This is exactly the "important unresolved product choice" the promptGuidelines describe.
+
+Expected agent behavior: Call `ask_user` with:
+  - question: "How should the habit tracker remind users about unfinished habits?"
+  - reason: "This affects user engagement, privacy permissions, and whether we need a backend or third-party service."
+  - options: [Browser push notifications, In-app badge counts, Daily email digest]
+  - recommendation: (optional, e.g., "Browser notifications for real-time engagement.")
+
+SCENARIO B — Agent should NOT use ask_user
+-------------------------------------------
+User prompt:
+  "Write a Python CLI to-do app using SQLite. Each task must have title, due_date (ISO 8601), and priority (low/medium/high). Store everything in a table called 'tasks'. Use the Click library for the command-line interface. I don't want any reminders, notifications, or recurring tasks. Just basic CRUD."
+
+Why the agent should NOT ask:
+- Every requirement is explicit: language (Python), storage (SQLite), schema (title, due_date, priority), table name, CLI library (Click).
+- The user explicitly ruled out reminders and recurring tasks.
+- There are no unresolved product choices; the scope is fully specified.
+- The promptGuidelines say: "Do NOT use ask_user when the user already specified behavior explicitly, for routine variable names, or when the user delegates the choice to you."
+
+Expected agent behavior: Proceed directly to implementation without calling `ask_user`. Generate the Python/Click/SQLite code immediately.
+
+--------------------------------------------------------------------
+SUMMARY TABLE
+--------------------------------------------------------------------
+
+| # | Issue | Severity | Affects agreed requirement? |
+|---|-------|----------|----------------------------|
+| 1 | Ambiguous / duplicate option labels cause wrong index | Serious | Yes — "Map responses into agreed result format" |
+| 2 | Cancelled paths (Esc vs empty) not distinguished | Minor | Partially — "Map responses into agreed result format" |
+| 3 | No UI handled correctly | None | N/A |
+| 4 | Answer contradicting recommendation not flagged | Minor | Partially — "Include answer/status in model-facing tool result" |
+| 5 | Custom answer matching option label not normalized | Minor | No — UX edge case |
+| 6 | Dialog safety fallback (`idx === -1`) untested | Minor | Partially — test coverage gap |
+| 7 | UI primitive exceptions propagate uncaught | Serious | Yes — robustness of "Check whether dialog UI is available" |
+| 8 | Schema allows duplicate labels | Serious | Yes — "Validate the input" |
+| 9 | Empty tradeoff strings allowed | Minor | Partially — "Validate the input" |
+| 10 | Recommendation is unstructured text | Minor | No — spec design choice |

@@ -1,0 +1,74 @@
+Reviewer Findings — ask_user implementation
+============================================
+
+Tests run: npx tsx --test ask_user.test.ts  → 10/10 passed
+Integration check: npx tsx integration_check.ts → passed
+
+--------------------------------------------------------------------
+DEFECT 1 — SERIOUS — Affects requirement: "Present the question with its reason and options"
+--------------------------------------------------------------------
+File: ask_user.ts
+Line: 99 inside the `dialog` closure (`const selected = await ctx.ui.select(params.question, labels);`)
+
+Finding: The dialog only passes `params.question` to `ctx.ui.select` and `ctx.ui.input`. The `params.reason` (and optional `params.recommendation`) are never included in the prompt shown to the user. Consequently, the interactive dialog displays the question and the option labels (with tradeoffs), but omits the explanation of WHY the choice matters and any recommendation that could guide the user.
+
+Reproduction: Run the tool with any params that include a `reason`. The user dialog shows only the question string; the reason is hidden.
+
+Expected: The prompt presented to the user should include both the question and the reason, e.g. by concatenating them into the select/input prompt string, so the user has the full context needed to make an informed choice.
+
+--------------------------------------------------------------------
+DEFECT 2 — SERIOUS — Affects requirement: "Map responses into the agreed result format"
+                    and general correctness coverage
+--------------------------------------------------------------------
+File: ask_user.test.ts
+Line: entire file (all tests)
+
+Finding: The test suite exercises ONLY `askUserHost` in `ask_user_host.ts`. There are zero tests for:
+- The tool registration in `ask_user.ts` (name, label, promptSnippet, promptGuidelines, executionMode)
+- The `execute()` method in `ask_user.ts`, including the defensive runtime validation of `options.length`
+- The `dialog` closure that orchestrates `ctx.ui.select` and `ctx.ui.input`
+- The `renderCall` and `renderResult` functions
+
+This means a regression in `ask_user.ts` (e.g., a bad label format, a missing `details` field, a renderer crash) would not be caught by the current test suite.
+
+Reproduction: None needed; coverage inspection shows 100% of tests import from `ask_user_host` and 0% import from `ask_user`.
+
+Expected: Add at least unit tests for `renderCall` and `renderResult`, and ideally an integration test that imports the registered tool object from `ask_user.ts` to verify its public contract (description, schema, executionMode, etc.).
+
+--------------------------------------------------------------------
+DEFECT 3 — MINOR — Affects requirement: "Validate the input (2-3 options, etc.)"
+--------------------------------------------------------------------
+File: ask_user.test.ts
+Line: 63 (inside the test "returns unavailable with optional recommendation omitted")
+
+Finding: The test fixture defines `options: [{ label: "A", tradeoff: "t" }]` — a single-option array. This violates the tool schema which enforces `minItems: 2` on `options`. Because the test calls `askUserHost` directly (bypassing schema validation), it does not fail at runtime, but it tests the host with data that is invalid per the tool contract.
+
+Reproduction: Inspect the fixture on line 63.
+
+Expected: Change the fixture to include at least 2 options so the test data remains valid under the tool schema.
+
+--------------------------------------------------------------------
+DEFECT 4 — MINOR — Affects requirement: "Include answer/status in model-facing tool result"
+--------------------------------------------------------------------
+File: ask_user.ts
+Line: 180 (inside `renderResult`)
+
+Finding: The defensive renderer logic uses:
+  `const idx = (details.options.indexOf(details.answer ?? "") + 1) || (details.answer ? "?" : "");`
+If `details.answer` is ever `null` in an "answered" status (which should not happen via the host, but is a typing possibility), the expression `details.answer ?? ""` becomes `""`. `indexOf("")` returns `-1`, so `idx` becomes `0`. Then `0 || ""` evaluates to `""`. The final `display` becomes `""` because `details.answer` is null/empty, so `renderResult` outputs only `"✓ "` with no answer text. This is a confusing fallback for an inconsistent state.
+
+Reproduction: Construct a mock `result` with `details.status === "answered"` and `details.answer === null` or `""`, then call `renderResult`.
+
+Expected: For an "answered" status with a missing answer, the renderer should display a clear fallback such as `"?"` or `"(no answer)"` rather than an empty display, making any data-consistency bug visible to the user.
+
+--------------------------------------------------------------------
+NON-DEFECTS — Verified correct
+--------------------------------------------------------------------
+1. Tool registration: name, label, description, promptSnippet, promptGuidelines, parameters, and executionMode are all present and clear.
+2. Schema validation: TypeBox schema enforces `minItems: 2`, `maxItems: 3` on options; `question` and `reason` are required strings; `recommendation` is optional.
+3. Runtime validation: `execute()` includes a defensive check that throws if `options` length is outside 2–3.
+4. UI availability check: `hasUI` is computed as `ctx.mode === "tui" && ctx.hasUI`, and `askUserHost` returns `unavailable` before opening any dialog.
+5. Response mapping: `answered`, `cancelled`, and `unavailable` are all mapped correctly with the agreed `AskUserDetails` shape.
+6. Model-facing result: `details` is returned at the top level of the tool result alongside `content`.
+7. promptSnippet and promptGuidelines: Present, clear, and include instructions on when to ask vs. proceed, plus the instruction not to invent answers when cancelled/unavailable.
+8. Custom answer handling: Empty or whitespace-only custom input is trimmed and treated as `null` → `cancelled`, satisfying the "no silent consent" rule.
