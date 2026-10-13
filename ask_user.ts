@@ -1,25 +1,21 @@
 /**
  * ask_user — single important-choice question with tradeoffs
  *
- * Displays one question, the reason it matters, 2–3 options (each with a
- * tradeoff), and an optional recommendation.  The user picks an option or
- * writes a custom answer.  The tool returns an explicit status:
- *   • "answered"    – user's custom response or the chosen option
- *   • "cancelled"   – user cancels or submits an empty custom response
- *   • "unavailable" – no interactive terminal UI is present
+ * Uses Pi's built-in select/input dialogs to present the question and
+ * collect the user's answer.  Delegates result mapping to ask_user_host
+ * so the pure business logic stays testable.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-  Editor,
-  type EditorTheme,
-  Key,
-  matchesKey,
-  Text,
-  visibleWidth,
-  wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+  askUserHost,
+  type AskUserOption,
+  type AskUserDetails,
+  type AskUserParams as HostAskUserParams,
+} from "./ask_user_host";
+import { runAskUserDialog, validateAskUserParams } from "./ask_user_dialog";
 
 /* ------------------------------------------------------------------ */
 /*  Schema                                                            */
@@ -52,27 +48,6 @@ const AskUserParams = Type.Object({
 });
 
 /* ------------------------------------------------------------------ */
-/*  Types                                                             */
-/* ------------------------------------------------------------------ */
-
-interface AskUserOption {
-  label: string;
-  tradeoff: string;
-}
-
-type DisplayOption = AskUserOption & { isOther?: boolean };
-
-interface AskUserDetails {
-  status: "answered" | "cancelled" | "unavailable";
-  question: string;
-  reason: string;
-  options: string[];
-  recommendation?: string;
-  answer: string | null;
-  wasCustom: boolean | null;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Tool                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -80,305 +55,50 @@ export default function askUser(pi: ExtensionAPI) {
   pi.registerTool({
     name: "ask_user",
     label: "Ask User",
+
+    // Prompt-listing text shown to the model in the Available tools section.
+    promptSnippet:
+      "Ask the user a single unresolved product choice with 2–3 labeled options and their tradeoffs. " +
+      "Returns whether the user answered, cancelled, or the UI was unavailable.",
+
     description:
       "Ask the user a single important unresolved product choice with 2–3 options and their tradeoffs. " +
-      "Call this tool when the user has left an important choice unresolved (for example, 'Make reminders persist or not, as you think best'). " +
-      "DO NOT call this tool when the user has already specified the behavior (for example, 'Keep reminder state only for this session. Do not persist it after the app closes'). " +
-      "DO NOT call for routine variable names, explicit requirements, or when the user delegates the choice to you. " +
-      "Proceed without questions for explicit requirements or routine reversible details.",
+      "The user picks one option or writes a custom answer. The tool returns an explicit status: " +
+      "'answered' (user chose or wrote an answer), 'cancelled' (user dismissed the dialog or " +
+      "submitted an empty custom answer), or 'unavailable' (no interactive UI is present).",
+
+    // Guidelines appended to the system prompt when this tool is active.
+    promptGuidelines: [
+      "Use ask_user when the user has left an important product choice unresolved (e.g. 'make reminders persist or not, as you think best').",
+      "Do NOT use ask_user when the user already specified behavior explicitly, for routine variable names, or when the user delegates the choice to you.",
+      "If the result is 'cancelled' or 'unavailable', do not invent an answer. Continue by identifying the exact unresolved requirement in your reasoning.",
+      "If the result is 'answered', use the user's exact answer on your next turn without silently overriding it.",
+    ],
+
     parameters: AskUserParams,
     executionMode: "sequential",
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      /* ---- non-interactive / no UI → explicit unavailable ----------- */
-      if (ctx.mode !== "tui" || !ctx.hasUI) {
-        const details: AskUserDetails = {
-          status: "unavailable",
-          question: params.question,
-          reason: params.reason,
-          options: params.options.map((o) => o.label),
-          recommendation: params.recommendation,
-          answer: null,
-          wasCustom: null,
-        };
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ask_user unavailable: no interactive terminal UI is present.",
-            },
-          ],
-          details,
-        };
-      }
+      // Runtime validation enforces unique labels, non-empty fields, correct count.
+      // Schema already enforces type-level constraints; this is defense in depth.
+      validateAskUserParams(params);
 
-      /* ---- option list (including custom) ------------------------- */
-      const allOptions: DisplayOption[] = [
-        ...params.options,
-        { label: "Write custom answer...", tradeoff: "", isOther: true },
-      ];
+      return askUserHost(params as HostAskUserParams, {
+        hasUI: ctx.mode === "tui" && ctx.hasUI,
 
-      /* ---- custom TUI --------------------------------------------- */
-      const result = await ctx.ui.custom<{
-        answer: string;
-        wasCustom: boolean;
-        index?: number;
-      } | null>((tui, theme, _kb, done) => {
-        let optionIndex = 0;
-        let editMode = false;
-        let cachedLines: string[] | undefined;
-
-        const editorTheme: EditorTheme = {
-          borderColor: (s) => theme.fg("accent", s),
-          selectList: {
-            selectedPrefix: (t) => theme.fg("accent", t),
-            selectedText: (t) => theme.fg("accent", t),
-            description: (t) => theme.fg("muted", t),
-            scrollInfo: (t) => theme.fg("dim", t),
-            noMatch: (t) => theme.fg("warning", t),
-          },
-        };
-        const editor = new Editor(tui, editorTheme);
-
-        editor.onSubmit = (value) => {
-          const trimmed = value.trim();
-          if (trimmed) {
-            done({ answer: trimmed, wasCustom: true });
-          } else {
-            /* empty custom answer → back to list (no silent consent) */
-            editMode = false;
-            editor.setText("");
-            refresh();
+        async dialog() {
+          try {
+            return await runAskUserDialog(params, {
+              select: (title, options) => ctx.ui.select(title, options),
+              input: (title) => ctx.ui.input(title),
+            });
+          } catch (_err) {
+            // UI primitive crashed or stream closed — treat as cancelled
+            // so the model gets a structured result instead of a raw error.
+            return null;
           }
-        };
-
-        function refresh() {
-          cachedLines = undefined;
-          tui.requestRender();
-        }
-
-        function handleInput(data: string) {
-          if (editMode) {
-            if (matchesKey(data, Key.escape)) {
-              editMode = false;
-              editor.setText("");
-              refresh();
-              return;
-            }
-            editor.handleInput(data);
-            refresh();
-            return;
-          }
-
-          if (matchesKey(data, Key.up)) {
-            optionIndex = Math.max(0, optionIndex - 1);
-            refresh();
-            return;
-          }
-          if (matchesKey(data, Key.down)) {
-            optionIndex = Math.min(allOptions.length - 1, optionIndex + 1);
-            refresh();
-            return;
-          }
-
-          if (matchesKey(data, Key.enter)) {
-            const selected = allOptions[optionIndex];
-            if (selected.isOther) {
-              editMode = true;
-              refresh();
-            } else {
-              done({
-                answer: selected.label,
-                wasCustom: false,
-                index: optionIndex + 1,
-              });
-            }
-            return;
-          }
-
-          if (matchesKey(data, Key.escape)) {
-            done(null); /* cancelled */
-            return;
-          }
-        }
-
-        /* ---- helpers ----------------------------------------------- */
-        function addWrapped(lines: string[], text: string, width: number) {
-          lines.push(...wrapTextWithAnsi(text, Math.max(1, width)));
-        }
-
-        function addWrappedWithPrefix(
-          lines: string[],
-          prefix: string,
-          text: string,
-          width: number,
-        ) {
-          const prefixWidth = visibleWidth(prefix);
-          const renderWidth = Math.max(1, width);
-          if (prefixWidth >= renderWidth) {
-            addWrapped(lines, prefix + text, width);
-            return;
-          }
-          const wrapped = wrapTextWithAnsi(text, renderWidth - prefixWidth);
-          const continuationPrefix = " ".repeat(prefixWidth);
-          for (let i = 0; i < wrapped.length; i++) {
-            lines.push(
-              `${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`,
-            );
-          }
-        }
-
-        /* ---- render ------------------------------------------------ */
-        function render(width: number): string[] {
-          if (cachedLines) return cachedLines;
-          const lines: string[] = [];
-          const w = Math.max(1, width);
-
-          /* header bar */
-          lines.push(theme.fg("accent", "─".repeat(w)));
-
-          /* question */
-          addWrappedWithPrefix(lines, " ", theme.fg("text", params.question), w);
-          lines.push("");
-
-          /* reason */
-          addWrappedWithPrefix(
-            lines,
-            " ",
-            theme.fg("muted", `Why it matters: ${params.reason}`),
-            w,
-          );
-
-          /* optional recommendation */
-          if (params.recommendation) {
-            lines.push("");
-            addWrappedWithPrefix(
-              lines,
-              " ",
-              theme.fg("accent", `Recommendation: ${params.recommendation}`),
-              w,
-            );
-          }
-
-          lines.push("");
-
-          /* options */
-          for (let i = 0; i < allOptions.length; i++) {
-            const opt = allOptions[i];
-            const selected = i === optionIndex;
-            const isOther = opt.isOther === true;
-            const prefix = selected ? theme.fg("accent", "> ") : "  ";
-            const labelColor = selected || (isOther && editMode) ? "accent" : "text";
-            const label = `${i + 1}. ${opt.label}${isOther && editMode ? " ✎" : ""}`;
-
-            addWrappedWithPrefix(lines, prefix, theme.fg(labelColor, label), w);
-
-            if (!isOther && opt.tradeoff) {
-              addWrappedWithPrefix(
-                lines,
-                "     ",
-                theme.fg("muted", `Tradeoff: ${opt.tradeoff}`),
-                w,
-              );
-            }
-          }
-
-          /* editor when in custom mode */
-          if (editMode) {
-            lines.push("");
-            addWrappedWithPrefix(
-              lines,
-              " ",
-              theme.fg("muted", "Your custom answer:"),
-              w,
-            );
-            for (const line of editor.render(Math.max(1, w - 2))) {
-              lines.push(` ${line}`);
-            }
-          }
-
-          /* footer hint */
-          lines.push("");
-          if (editMode) {
-            addWrappedWithPrefix(
-              lines,
-              " ",
-              theme.fg("dim", "Enter to submit • Esc to go back"),
-              w,
-            );
-          } else {
-            addWrappedWithPrefix(
-              lines,
-              " ",
-              theme.fg("dim", "↑↓ navigate • Enter to select • Esc to cancel"),
-              w,
-            );
-          }
-          lines.push(theme.fg("accent", "─".repeat(w)));
-
-          cachedLines = lines;
-          return lines;
-        }
-
-        return {
-          render,
-          invalidate: () => {
-            cachedLines = undefined;
-          },
-          handleInput,
-        };
+        },
       });
-
-      /* ---- build result ------------------------------------------- */
-      const simpleOptions = params.options.map((o) => o.label);
-
-      if (!result) {
-        const details: AskUserDetails = {
-          status: "cancelled",
-          question: params.question,
-          reason: params.reason,
-          options: simpleOptions,
-          recommendation: params.recommendation,
-          answer: null,
-          wasCustom: null,
-        };
-        return {
-          content: [{ type: "text", text: "User cancelled the question." }],
-          details,
-        };
-      }
-
-      const details: AskUserDetails = {
-        status: "answered",
-        question: params.question,
-        reason: params.reason,
-        options: simpleOptions,
-        recommendation: params.recommendation,
-        answer: result.answer,
-        wasCustom: result.wasCustom,
-      };
-
-      if (result.wasCustom) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `User provided a custom answer: ${result.answer}`,
-            },
-          ],
-          details,
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `User selected option ${result.index}: ${result.answer}`,
-          },
-        ],
-        details,
-      };
     },
 
     /* ---------------------------------------------------------------- */
@@ -430,7 +150,9 @@ export default function askUser(pi: ExtensionAPI) {
       const idx =
         (details.options.indexOf(details.answer ?? "") + 1) ||
         (details.answer ? "?" : "");
-      const display = details.answer ? `${idx}. ${details.answer}` : "";
+      const display = details.answer
+        ? `${idx}. ${details.answer}`
+        : "(no answer)";
       return new Text(
         theme.fg("success", "✓ ") + theme.fg("accent", display),
         0,
